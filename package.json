@@ -1,6 +1,6 @@
 {
   "name": "@kongyo2/saens",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Experimental library that splices an input audio's nearest-pitch segments into the notes of a reference MIDI file.",
   "type": "module",
   "main": "./dist/index.js",
