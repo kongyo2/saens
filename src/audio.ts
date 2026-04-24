@@ -1,5 +1,8 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { spawn } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const require = createRequire(import.meta.url);
 const { WaveFile } = require("wavefile") as typeof import("wavefile");
@@ -71,12 +74,17 @@ function parseWav(input: Uint8Array): ParsedWav {
       const dataSize = view.getBigUint64(body + 8, littleEndian);
       ds64DataSize = dataSize;
     } else if (id === "fmt ") {
-      if (size < 16) throw new Error("fmt chunk is too short");
+      // Legacy WAVEFORMAT is 14 bytes (no bitsPerSample field). PCMWAVEFORMAT
+      // is 16, WAVEFORMATEX is 18, WAVEFORMATEXTENSIBLE is 40. Accept all.
+      if (size < 14) throw new Error("fmt chunk is too short");
       const audioFormat = view.getUint16(body, littleEndian);
       const numChannels = view.getUint16(body + 2, littleEndian);
       const sampleRate = view.getUint32(body + 4, littleEndian);
       const blockAlign = view.getUint16(body + 12, littleEndian);
-      const bitsPerSample = view.getUint16(body + 14, littleEndian);
+      // bitsPerSample only exists from PCMWAVEFORMAT (size >= 16) onward. For
+      // legacy 14-byte headers assume 8-bit (typical for A-law / mu-law).
+      const bitsPerSample =
+        size >= 16 ? view.getUint16(body + 14, littleEndian) : 8;
       let subFormat: number | undefined;
       if (audioFormat === FMT_EXTENSIBLE && size >= 40) {
         subFormat = view.getUint16(body + 24, littleEndian);
@@ -248,7 +256,41 @@ function decodeLog(
 export async function loadWav(path: string): Promise<AudioBuffer> {
   const buf = await readFile(path);
   const input = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-  const { fmt, dataOffset, dataLength, littleEndian } = parseWav(input);
+  return decodeAudio(input, path);
+}
+
+async function decodeAudio(
+  input: Uint8Array,
+  sourcePath: string,
+): Promise<AudioBuffer> {
+  // Try the manual parser first. It succeeds on the vast majority of real-world
+  // WAV files (PCM, float, A-law, mu-law, WAVE_FORMAT_EXTENSIBLE).
+  try {
+    const parsed = parseWav(input);
+    const decoded = tryDecodeParsed(input, parsed);
+    if (decoded) return decoded;
+  } catch {
+    // Not a WAV we can understand — fall through.
+  }
+
+  // Next: wavefile covers IMA ADPCM and some other formats with a permissive
+  // parser.
+  try {
+    return loadWavViaWaveFile(input);
+  } catch {
+    // Fall through to ffmpeg.
+  }
+
+  // Last resort: shell out to ffmpeg (bundled via ffmpeg-static). This handles
+  // MS ADPCM, GSM 6.10, MP3-in-WAV, truncated headers, and non-WAV audio.
+  return loadViaFfmpeg(sourcePath);
+}
+
+function tryDecodeParsed(
+  input: Uint8Array,
+  parsed: ParsedWav,
+): AudioBuffer | undefined {
+  const { fmt, dataOffset, dataLength, littleEndian } = parsed;
   const view = new DataView(input.buffer, input.byteOffset, input.byteLength);
 
   const effectiveFormat =
@@ -280,7 +322,7 @@ export async function loadWav(path: string): Promise<AudioBuffer> {
     }
     case FMT_FLOAT: {
       if (fmt.bitsPerSample !== 32 && fmt.bitsPerSample !== 64) {
-        throw new Error(`Unsupported float bit depth: ${fmt.bitsPerSample}`);
+        return undefined;
       }
       const samples = decodeFloat(
         view,
@@ -316,8 +358,7 @@ export async function loadWav(path: string): Promise<AudioBuffer> {
       return { samples, sampleRate: fmt.sampleRate };
     }
     default:
-      // Fall back to wavefile for any remaining formats (e.g. IMA ADPCM).
-      return loadWavViaWaveFile(buf);
+      return undefined;
   }
 }
 
@@ -342,6 +383,80 @@ function loadWavViaWaveFile(buf: Uint8Array): AudioBuffer {
   }
   const fmt = wav.fmt as { sampleRate: number };
   return { samples: mono, sampleRate: fmt.sampleRate };
+}
+
+function resolveFfmpegPath(): string | undefined {
+  try {
+    const mod = require("ffmpeg-static") as unknown;
+    if (typeof mod === "string") return mod;
+    if (mod && typeof mod === "object" && "default" in mod) {
+      const def = (mod as { default: unknown }).default;
+      if (typeof def === "string") return def;
+    }
+  } catch {
+    // ffmpeg-static not installed (shouldn't happen — it's a dep).
+  }
+  // Final fallback: rely on ffmpeg from PATH.
+  return "ffmpeg";
+}
+
+async function loadViaFfmpeg(sourcePath: string): Promise<AudioBuffer> {
+  const ffmpegPath = resolveFfmpegPath();
+  if (!ffmpegPath) {
+    throw new Error("Unable to decode audio: no ffmpeg binary available");
+  }
+  const scratchDir = await mkdtemp(join(tmpdir(), "saens-wav-"));
+  const outPath = join(scratchDir, "decoded.wav");
+  try {
+    await runFfmpeg(ffmpegPath, [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-y",
+      "-i",
+      sourcePath,
+      "-vn",
+      "-ac",
+      "1",
+      "-c:a",
+      "pcm_f32le",
+      "-f",
+      "wav",
+      outPath,
+    ]);
+    const raw = await readFile(outPath);
+    const input = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+    const parsed = parseWav(input);
+    const decoded = tryDecodeParsed(input, parsed);
+    if (!decoded) {
+      throw new Error("ffmpeg output was not decodable");
+    }
+    return decoded;
+  } finally {
+    await rm(scratchDir, { recursive: true, force: true });
+  }
+}
+
+function runFfmpeg(binary: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(binary, args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(
+          new Error(
+            `ffmpeg exited with code ${code}: ${stderr.trim() || "no stderr"}`,
+          ),
+        );
+      }
+    });
+  });
 }
 
 export async function writeWav(
