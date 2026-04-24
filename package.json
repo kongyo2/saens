@@ -1,5 +1,5 @@
 {
-  "name": "midi-audio-splicer",
+  "name": "@kongyo2/saens",
   "version": "0.1.0",
   "description": "Experimental library that splices an input audio's nearest-pitch segments into the notes of a reference MIDI file.",
   "type": "module",
@@ -12,11 +12,11 @@
     }
   },
   "bin": {
-    "midi-audio-splicer": "./dist/cli.js"
+    "saens": "./dist/cli.js"
   },
   "files": [
     "dist",
-    "README.md"
+    "元データ.mid"
   ],
   "scripts": {
     "build": "tsc",

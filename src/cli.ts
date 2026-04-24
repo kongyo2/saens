@@ -1,7 +1,6 @@
-import { renderMidiFromAudio } from "./index.js";
+import { renderMidiFromAudio, bundledMidiPath } from "./index.js";
 
 interface CliArgs {
-  midi: string;
   audio: string;
   out: string;
 }
@@ -12,10 +11,7 @@ function parseArgs(argv: string[]): CliArgs {
     const key = argv[i];
     const value = argv[i + 1];
     if (!key || !value) continue;
-    if (key === "--midi") {
-      args.midi = value;
-      i++;
-    } else if (key === "--audio") {
+    if (key === "--audio") {
       args.audio = value;
       i++;
     } else if (key === "--out") {
@@ -23,10 +19,8 @@ function parseArgs(argv: string[]): CliArgs {
       i++;
     }
   }
-  if (!args.midi || !args.audio || !args.out) {
-    throw new Error(
-      "Usage: tsx src/cli.ts --midi <path> --audio <path> --out <path>",
-    );
+  if (!args.audio || !args.out) {
+    throw new Error("Usage: tsx src/cli.ts --audio <path> --out <path>");
   }
   return args as CliArgs;
 }
@@ -35,11 +29,10 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const args = parseArgs(argv);
   await renderMidiFromAudio({
-    midiPath: args.midi,
     audioPath: args.audio,
     outputPath: args.out,
   });
-  process.stdout.write(`Wrote ${args.out}\n`);
+  process.stdout.write(`Wrote ${args.out} (MIDI: ${bundledMidiPath})\n`);
 }
 
 main().catch((error: unknown) => {

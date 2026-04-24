@@ -14,13 +14,15 @@ export {
   type SpliceInput,
   type SpliceOptions,
 } from "./splice.js";
+export { bundledMidiPath } from "./defaults.js";
 
+import { bundledMidiPath } from "./defaults.js";
 import { loadMidiNotes } from "./midi.js";
 import { loadWav, writeWav } from "./audio.js";
 import { spliceAudioFromMidi, type SpliceOptions } from "./splice.js";
 
 export interface RenderOptions {
-  midiPath: string;
+  midiPath?: string;
   audioPath: string;
   outputPath: string;
   splice?: Partial<SpliceOptions>;
@@ -29,8 +31,9 @@ export interface RenderOptions {
 export async function renderMidiFromAudio(
   options: RenderOptions,
 ): Promise<void> {
+  const midiPath = options.midiPath ?? bundledMidiPath;
   const [{ notes, duration }, source] = await Promise.all([
-    loadMidiNotes(options.midiPath),
+    loadMidiNotes(midiPath),
     loadWav(options.audioPath),
   ]);
   const result = spliceAudioFromMidi({
