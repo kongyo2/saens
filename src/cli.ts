@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { renderMidiFromAudio, bundledMidiPath } from "./index.js";
 
 interface CliArgs {

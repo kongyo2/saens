@@ -27,12 +27,17 @@
     "lint:strict": "oxlint --deny-warnings",
     "check:file": "oxlint",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "prepublishOnly": "npm run build"
   },
   "repository": {
     "type": "git",
-    "url": "http://local_proxy@127.0.0.1:36139/git/kongyo2/midi"
+    "url": "git+https://github.com/kongyo2/saens.git"
   },
+  "bugs": {
+    "url": "https://github.com/kongyo2/saens/issues"
+  },
+  "homepage": "https://github.com/kongyo2/saens#readme",
   "keywords": [
     "midi",
     "audio",
@@ -40,8 +45,14 @@
     "splice",
     "concatenative"
   ],
-  "author": "",
-  "license": "ISC",
+  "author": "kongyo2",
+  "license": "Unlicense",
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "@types/node": "^25.6.0",
     "oxlint": "^1.61.0",
