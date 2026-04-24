@@ -2,10 +2,12 @@
 // accept any real-world file. Run with: npx tsx scripts/wav-formats-test.ts
 import { mkdir, writeFile, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { spawn } from "node:child_process";
 import { loadWav } from "../src/audio.js";
 
 const require = createRequire(import.meta.url);
 const { WaveFile } = require("wavefile") as typeof import("wavefile");
+const ffmpegPath = require("ffmpeg-static") as string;
 
 const sampleRate = 22050;
 const duration = 0.2;
@@ -149,6 +151,87 @@ async function writeExtensibleFloat(
   await writeFile(path, buf);
 }
 
+function runFfmpeg(args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ffmpegPath, args, {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg failed (${code}): ${stderr.trim()}`));
+    });
+  });
+}
+
+async function writeViaFfmpeg(
+  path: string,
+  numChannels: number,
+  codec: string,
+): Promise<void> {
+  // Build a PCM seed via ffmpeg's lavfi sine generator, then re-encode it into
+  // the requested codec. This lets us exercise formats wavefile can't author.
+  await runFfmpeg([
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-y",
+    "-f",
+    "lavfi",
+    "-i",
+    `sine=frequency=${freq}:sample_rate=${sampleRate}:duration=${duration}`,
+    "-ac",
+    String(numChannels),
+    "-c:a",
+    codec,
+    path,
+  ]);
+}
+
+async function writeLegacy14ByteFmt(
+  path: string,
+  audioFormat: number,
+  bytesPerSample: number,
+  bytes: Uint8Array,
+): Promise<void> {
+  // Hand-roll a WAVE file with a 14-byte WAVEFORMAT header (no bitsPerSample).
+  const fmtSize = 14;
+  const dataBytes = bytes.length;
+  const totalBody = 4 + (8 + fmtSize) + (8 + dataBytes);
+  const buf = Buffer.alloc(8 + totalBody);
+  let o = 0;
+  buf.write("RIFF", o);
+  o += 4;
+  buf.writeUInt32LE(totalBody, o);
+  o += 4;
+  buf.write("WAVE", o);
+  o += 4;
+  buf.write("fmt ", o);
+  o += 4;
+  buf.writeUInt32LE(fmtSize, o);
+  o += 4;
+  buf.writeUInt16LE(audioFormat, o);
+  o += 2;
+  buf.writeUInt16LE(1, o);
+  o += 2; // numChannels
+  buf.writeUInt32LE(sampleRate, o);
+  o += 4;
+  buf.writeUInt32LE(sampleRate * bytesPerSample, o);
+  o += 4; // byteRate
+  buf.writeUInt16LE(bytesPerSample, o);
+  o += 2; // blockAlign
+  buf.write("data", o);
+  o += 4;
+  buf.writeUInt32LE(dataBytes, o);
+  o += 4;
+  Buffer.from(bytes).copy(buf, o);
+  await writeFile(path, buf);
+}
+
 interface Case {
   label: string;
   build: (path: string) => Promise<void>;
@@ -216,6 +299,48 @@ const cases: Case[] = [
   {
     label: "WAVE_FORMAT_EXTENSIBLE float stereo",
     build: (p) => writeExtensibleFloat(p, 2),
+  },
+  {
+    label: "legacy 14-byte mu-Law (WAVEFORMAT, no bitsPerSample)",
+    build: async (p) => {
+      // Encode real mu-Law bytes via wavefile, extract the data, and drop them
+      // into a hand-rolled WAVEFORMAT-sized header.
+      const wav = new WaveFile();
+      wav.fromScratch(
+        1,
+        sampleRate,
+        "16",
+        makeSine(1, 16) as unknown as number[],
+      );
+      wav.toMuLaw();
+      const samples = wav.getSamples(false, Uint8Array) as unknown as
+        | Uint8Array
+        | Uint8Array[];
+      const bytes = Array.isArray(samples)
+        ? (samples[0] ?? new Uint8Array())
+        : samples;
+      await writeLegacy14ByteFmt(p, 0x0007, 1, bytes);
+    },
+  },
+  {
+    label: "MS ADPCM mono (via ffmpeg)",
+    build: (p) => writeViaFfmpeg(p, 1, "adpcm_ms"),
+  },
+  {
+    label: "MS ADPCM stereo (via ffmpeg)",
+    build: (p) => writeViaFfmpeg(p, 2, "adpcm_ms"),
+  },
+  {
+    label: "IMA ADPCM mono (via ffmpeg)",
+    build: (p) => writeViaFfmpeg(p, 1, "adpcm_ima_wav"),
+  },
+  {
+    label: "Yamaha ADPCM mono (via ffmpeg)",
+    build: (p) => writeViaFfmpeg(p, 1, "adpcm_yamaha"),
+  },
+  {
+    label: "Yamaha ADPCM stereo (via ffmpeg)",
+    build: (p) => writeViaFfmpeg(p, 2, "adpcm_yamaha"),
   },
 ];
 
