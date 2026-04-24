@@ -1,0 +1,57 @@
+{
+  "name": "midi-audio-splicer",
+  "version": "0.1.0",
+  "description": "Experimental library that splices an input audio's nearest-pitch segments into the notes of a reference MIDI file.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "midi-audio-splicer": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "render": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint --silent",
+    "lint:strict": "oxlint --deny-warnings",
+    "check:file": "oxlint",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://local_proxy@127.0.0.1:36139/git/kongyo2/midi"
+  },
+  "keywords": [
+    "midi",
+    "audio",
+    "pitch",
+    "splice",
+    "concatenative"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "oxlint": "^1.61.0",
+    "prettier": "^3.8.3",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@tonejs/midi": "^2.0.28",
+    "pitchfinder": "^2.3.4",
+    "wavefile": "^11.0.0"
+  }
+}
