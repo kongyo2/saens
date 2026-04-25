@@ -1,5 +1,9 @@
 #!/usr/bin/env node
-import { renderMidiFromAudio, bundledMidiPath } from "./index.js";
+import {
+  renderMidiFromAudio,
+  bundledMidiPath,
+  bundledWavPath,
+} from "./index.js";
 
 interface CliArgs {
   audio: string;
@@ -33,7 +37,9 @@ async function main(): Promise<void> {
     audioPath: args.audio,
     outputPath: args.out,
   });
-  process.stdout.write(`Wrote ${args.out} (MIDI: ${bundledMidiPath})\n`);
+  process.stdout.write(
+    `Wrote ${args.out} (MIDI: ${bundledMidiPath}, reference WAV: ${bundledWavPath})\n`,
+  );
 }
 
 main().catch((error: unknown) => {

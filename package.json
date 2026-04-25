@@ -1,6 +1,6 @@
 {
   "name": "@kongyo2/saens",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Experimental library that splices an input audio's nearest-pitch segments into the notes of a reference MIDI file.",
   "type": "module",
   "main": "./dist/index.js",
@@ -16,7 +16,8 @@
   },
   "files": [
     "dist",
-    "元データ.mid"
+    "元データ.mid",
+    "2.wav"
   ],
   "scripts": {
     "build": "tsc",

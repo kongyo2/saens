@@ -1,4 +1,12 @@
 import type { AudioBuffer } from "./audio.js";
+import {
+  buildAudioFeatureIndex,
+  buildReferenceFeatureSegment,
+  normalizeFeatureIndexes,
+  scoreFeatureSegment,
+  type AudioFeatureIndex,
+  type ReferenceFeatureSegment,
+} from "./features.js";
 import type { MidiNote } from "./midi.js";
 import {
   analyzePitches,
@@ -19,20 +27,79 @@ export const defaultSpliceOptions: SpliceOptions = {
   analyze: defaultAnalyzeOptions,
 };
 
+const waveformCandidateCount = 384;
+const maxWaveformPitchDiff = 1.8;
+const pitchScoreWeight = 0.06;
+
+interface PitchCandidate {
+  window: PitchWindow;
+  pitchDiff: number;
+}
+
+function collectPitchCandidates(
+  windows: PitchWindow[],
+  targetMidi: number,
+): PitchCandidate[] {
+  const candidates: PitchCandidate[] = [];
+  for (const window of windows) {
+    const pitchDiff = Math.abs(window.midi - targetMidi);
+    const candidate = { window, pitchDiff };
+    let index = 0;
+    while (index < candidates.length) {
+      const existing = candidates[index];
+      if (!existing || existing.pitchDiff > pitchDiff) break;
+      index++;
+    }
+    if (index < waveformCandidateCount) {
+      candidates.splice(index, 0, candidate);
+      if (candidates.length > waveformCandidateCount) candidates.pop();
+    }
+  }
+  return candidates;
+}
+
 function pickBestWindow(
   windows: PitchWindow[],
   targetMidi: number,
+  sourceFeatures?: AudioFeatureIndex,
+  reference?: ReferenceFeatureSegment,
 ): PitchWindow | undefined {
-  let best: PitchWindow | undefined;
-  let bestDiff = Infinity;
-  for (const window of windows) {
-    const diff = Math.abs(window.midi - targetMidi);
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      best = window;
+  const candidates = collectPitchCandidates(windows, targetMidi);
+  const nearest = candidates[0];
+  if (!nearest) return undefined;
+  if (!sourceFeatures || !reference) return nearest.window;
+
+  const pitchGuard = Math.min(
+    maxWaveformPitchDiff,
+    Math.max(0.8, nearest.pitchDiff + 1),
+  );
+  let best = nearest;
+  let bestScore = Infinity;
+
+  for (const candidate of candidates) {
+    if (candidate.pitchDiff > pitchGuard) {
+      continue;
+    }
+    const featureScore = scoreFeatureSegment(
+      sourceFeatures,
+      candidate.window.startSample / sourceFeatures.sampleRate,
+      reference,
+    );
+    if (!Number.isFinite(featureScore)) continue;
+
+    const pitchScore =
+      Math.pow(Math.max(0, candidate.pitchDiff), 1.25) * pitchScoreWeight;
+    const score = featureScore + pitchScore;
+    if (
+      score < bestScore ||
+      (score === bestScore && candidate.pitchDiff < best.pitchDiff)
+    ) {
+      bestScore = score;
+      best = candidate;
     }
   }
-  return best;
+
+  return Number.isFinite(bestScore) ? best.window : nearest.window;
 }
 
 function copyWithLoop(
@@ -69,8 +136,31 @@ function applyFade(buffer: Float32Array, fadeSamples: number): void {
   }
 }
 
+function buildFeaturePair(
+  source: AudioBuffer,
+  reference: AudioBuffer | undefined,
+):
+  | {
+      sourceFeatures: AudioFeatureIndex;
+      referenceFeatures: AudioFeatureIndex;
+    }
+  | undefined {
+  if (!reference) return undefined;
+  const sourceFeatures = buildAudioFeatureIndex(
+    source.samples,
+    source.sampleRate,
+  );
+  const referenceFeatures = buildAudioFeatureIndex(
+    reference.samples,
+    reference.sampleRate,
+  );
+  normalizeFeatureIndexes([sourceFeatures, referenceFeatures]);
+  return { sourceFeatures, referenceFeatures };
+}
+
 export interface SpliceInput {
   source: AudioBuffer;
+  reference?: AudioBuffer;
   notes: MidiNote[];
   midiDuration: number;
   options?: Partial<SpliceOptions>;
@@ -91,6 +181,7 @@ export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
     );
   }
 
+  const featurePair = buildFeaturePair(source, input.reference);
   const outputLength = Math.ceil(
     (midiDuration + options.tailSeconds) * sampleRate,
   );
@@ -98,15 +189,29 @@ export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
   const fadeSamples = Math.max(1, Math.floor(options.fadeSeconds * sampleRate));
 
   for (const note of notes) {
-    const best = pickBestWindow(windows, note.midi);
-    if (!best) continue;
     const noteSamples = Math.max(1, Math.floor(note.duration * sampleRate));
+    const reference =
+      featurePair &&
+      buildReferenceFeatureSegment(
+        featurePair.referenceFeatures,
+        note.time,
+        note.duration,
+      );
+    const best = pickBestWindow(
+      windows,
+      note.midi,
+      featurePair?.sourceFeatures,
+      reference || undefined,
+    );
+    if (!best) continue;
+
     const segment = copyWithLoop(source.samples, best.startSample, noteSamples);
     const gain = Math.max(0, Math.min(1, note.velocity));
     for (let i = 0; i < segment.length; i++) {
       segment[i] = (segment[i] ?? 0) * gain;
     }
     applyFade(segment, fadeSamples);
+
     const offset = Math.floor(note.time * sampleRate);
     const end = Math.min(output.length, offset + segment.length);
     for (let i = 0, j = offset; j < end; i++, j++) {
