@@ -33,6 +33,14 @@ export interface SpliceOptions {
    * on the source's own words for a while but still breaks to chase the tune.
    */
   pitchDriftPenalty: number;
+  /**
+   * Consonant-joining strength (0..1). At reference frames where the spectrum
+   * changes sharply — consonant onsets / syllable attacks — continuity is
+   * suppressed by this much so a fresh matching consonant grain is stitched in,
+   * the way 人力 (hand-made) edits splice a crisp consonant onto a vowel. Steady
+   * vowels keep full continuity, so this sharpens articulation without flutter.
+   */
+  onsetSensitivity: number;
 }
 
 export const defaultSpliceOptions: SpliceOptions = {
@@ -42,6 +50,7 @@ export const defaultSpliceOptions: SpliceOptions = {
   pitchTolerance: 2,
   continuityMargin: 0.6,
   pitchDriftPenalty: 0.05,
+  onsetSensitivity: 0.85,
 };
 
 // ---- lightweight FFT-autocorrelation pitch tracker (aligned to feature frames) ----
@@ -269,6 +278,24 @@ export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
     Math.floor(midiDuration / hopSeconds),
   );
 
+  // Onset strength per reference frame = how much its spectrum differs from the
+  // previous frame. Peaks mark consonant attacks / syllable starts, where we
+  // want to break continuity and stitch a fresh matching consonant grain.
+  const onsetStrength = new Float32Array(referenceFrameMax);
+  let onsetMean = 0;
+  for (let rf = 1; rf < referenceFrameMax; rf++) {
+    const flux = frameFeatureDistance(referenceIndex, rf, referenceIndex, rf - 1);
+    onsetStrength[rf] = flux;
+    onsetMean += flux;
+  }
+  onsetMean /= Math.max(1, referenceFrameMax - 1);
+  let onsetVariance = 0;
+  for (let rf = 1; rf < referenceFrameMax; rf++) {
+    const d = (onsetStrength[rf] ?? 0) - onsetMean;
+    onsetVariance += d * d;
+  }
+  const onsetScale = onsetMean + 1.5 * Math.sqrt(onsetVariance / Math.max(1, referenceFrameMax - 1));
+
   const frameCount = sourceIndex.frameCount;
   // `cursor` is the source frame currently playing; it advances one frame at a
   // time so the source's own words play through contiguously, and only jumps
@@ -304,6 +331,12 @@ export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
       }
     }
 
+    // Continuity is relaxed at consonant onsets so a fresh consonant grain is
+    // stitched in (the 人力 consonant-join), and full through steady vowels.
+    const onsetNorm = onsetScale > 0 ? Math.min(1, (onsetStrength[rf] ?? 0) / onsetScale) : 0;
+    const effectiveMargin =
+      options.continuityMargin * Math.max(0, 1 - options.onsetSensitivity * onsetNorm);
+
     // Cost of simply continuing the current run one frame forward, with a gentle
     // pull back toward the melody so a run doesn't hold a wrong pitch forever.
     let chosen = bestJump;
@@ -314,7 +347,7 @@ export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
       if (!Number.isNaN(targetPitch) && !Number.isNaN(contMidi)) {
         contScore += foldedDistance(contMidi, targetPitch) * options.pitchDriftPenalty;
       }
-      if (contScore <= bestJumpScore + options.continuityMargin) {
+      if (contScore <= bestJumpScore + effectiveMargin) {
         chosen = contFrame;
         contiguousFrames++;
       }
