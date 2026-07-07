@@ -15,16 +15,24 @@ export interface SpliceOptions {
   /** Pitch analysis bounds. */
   analyze: AnalyzeOptions;
   /**
-   * Octave-folded semitone tolerance when constraining a grain to the MIDI
-   * pitch. Grains outside this are only used when nothing closer carries the
+   * Octave-folded semitone tolerance used when *jumping* to a fresh source
+   * position. Grains outside this are only used when nothing closer carries the
    * required phoneme.
    */
   pitchTolerance: number;
   /**
-   * Bonus (in phonetic-distance units) for continuing the previous source run
-   * one frame forward, which keeps articulation contiguous and natural.
+   * Hysteresis margin. Keep playing the current source run forward unless
+   * jumping elsewhere beats "continue" by more than this (phonetic-distance
+   * units). Larger → longer contiguous cut-and-paste chunks of the source's own
+   * words (the meme character); 0 → re-pick the best phoneme every frame.
    */
-  continuityBonus: number;
+  continuityMargin: number;
+  /**
+   * How strongly a held run is pulled back toward the melody. A running chunk
+   * accrues this penalty per octave-folded semitone of pitch error, so it stays
+   * on the source's own words for a while but still breaks to chase the tune.
+   */
+  pitchDriftPenalty: number;
 }
 
 export const defaultSpliceOptions: SpliceOptions = {
@@ -32,7 +40,8 @@ export const defaultSpliceOptions: SpliceOptions = {
   tailSeconds: 0.25,
   analyze: defaultAnalyzeOptions,
   pitchTolerance: 2,
-  continuityBonus: 0.15,
+  continuityMargin: 0.6,
+  pitchDriftPenalty: 0.05,
 };
 
 // ---- lightweight FFT-autocorrelation pitch tracker (aligned to feature frames) ----
@@ -261,43 +270,58 @@ export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
   );
 
   const frameCount = sourceIndex.frameCount;
-  let previousFrame = -1;
+  // `cursor` is the source frame currently playing; it advances one frame at a
+  // time so the source's own words play through contiguously, and only jumps
+  // when a fresh position matches the target phoneme markedly better.
+  let cursor = -1;
+  let contiguousFrames = 0;
+  let renderedFrames = 0;
   for (let rf = 0; rf < referenceFrameMax; rf++) {
     const targetPitch = pitchTargets[rf] ?? NaN;
-    let chosen = -1;
-    let bestScore = Infinity;
 
+    // Best fresh position: closest phoneme among grains near the target pitch.
+    let bestJump = -1;
+    let bestJumpScore = Infinity;
     if (!Number.isNaN(targetPitch)) {
-      // Among source frames near the target pitch, take the closest phoneme.
-      // Cheap pitch test first, so the phonetic distance is only computed for
-      // the handful of candidates that carry the right note.
       for (let sf = 0; sf < frameCount; sf++) {
         const sourceMidi = sourcePitch[sf] ?? NaN;
         if (Number.isNaN(sourceMidi)) continue;
         if (foldedDistance(sourceMidi, targetPitch) > options.pitchTolerance) continue;
         const distance = frameFeatureDistance(sourceIndex, sf, referenceIndex, rf);
-        const score = distance - (sf === previousFrame + 1 ? options.continuityBonus : 0);
-        if (score < bestScore) {
-          bestScore = score;
-          chosen = sf;
+        if (distance < bestJumpScore) {
+          bestJumpScore = distance;
+          bestJump = sf;
+        }
+      }
+    }
+    if (bestJump < 0) {
+      for (let sf = 0; sf < frameCount; sf++) {
+        const distance = frameFeatureDistance(sourceIndex, sf, referenceIndex, rf);
+        if (distance < bestJumpScore) {
+          bestJumpScore = distance;
+          bestJump = sf;
         }
       }
     }
 
-    // No note active, or the source has nothing at the required pitch: fall back
-    // to the best phonetic match regardless of pitch so the word still lands.
-    if (chosen < 0) {
-      for (let sf = 0; sf < frameCount; sf++) {
-        const distance = frameFeatureDistance(sourceIndex, sf, referenceIndex, rf);
-        const score = distance - (sf === previousFrame + 1 ? options.continuityBonus : 0);
-        if (score < bestScore) {
-          bestScore = score;
-          chosen = sf;
-        }
+    // Cost of simply continuing the current run one frame forward, with a gentle
+    // pull back toward the melody so a run doesn't hold a wrong pitch forever.
+    let chosen = bestJump;
+    if (cursor >= 0 && cursor + 1 < frameCount) {
+      const contFrame = cursor + 1;
+      let contScore = frameFeatureDistance(sourceIndex, contFrame, referenceIndex, rf);
+      const contMidi = sourcePitch[contFrame] ?? NaN;
+      if (!Number.isNaN(targetPitch) && !Number.isNaN(contMidi)) {
+        contScore += foldedDistance(contMidi, targetPitch) * options.pitchDriftPenalty;
+      }
+      if (contScore <= bestJumpScore + options.continuityMargin) {
+        chosen = contFrame;
+        contiguousFrames++;
       }
     }
     if (chosen < 0) continue;
-    previousFrame = chosen;
+    cursor = chosen;
+    renderedFrames++;
 
     const sourceStart = chosen * sourceHopSamples;
     const destStart = Math.floor(rf * hopSeconds * sampleRate);
@@ -324,6 +348,13 @@ export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
   if (peak > 1) {
     const scale = 0.98 / peak;
     for (let i = 0; i < output.length; i++) output[i] = (output[i] ?? 0) * scale;
+  }
+
+  if (process.env.SPLICE_DEBUG === "1") {
+    const contiguity = renderedFrames > 0 ? contiguousFrames / renderedFrames : 0;
+    process.stderr.write(
+      `[splice] contiguity=${contiguity.toFixed(3)} frames=${renderedFrames}\n`,
+    );
   }
 
   return { samples: output, sampleRate };
