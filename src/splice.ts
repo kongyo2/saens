@@ -217,12 +217,14 @@ export interface SpliceInput {
 }
 
 /**
- * Vocal cross-synthesis. For every frame of the reference (which carries the
- * words/pronunciation, aligned to the MIDI), pick the source grain whose timbre
- * best matches that reference frame while sitting near the MIDI's pitch, and
- * overlap-add it. The result speaks the reference's phonemes in the source's
- * voice at the MIDI's pitches. Grain selection is contiguous where possible so
- * articulation stays natural.
+ * 空耳／人力系ミームの合成。元曲（参照）を MIDI ノート単位のスライスに区切り、
+ * 各スライスについて、その区間の参照の音（発音）に「スライス全体で」最も似ていて
+ * ノート近傍のピッチを持つ入力位置を選ぶ。音声はその入力位置から生サンプルをそのまま
+ * （verbatim に）コピーして貼り（繋ぎ目のみ短くクロスフェード）、入力全体を飛び回って
+ * 元曲へ並べ替える。結果は「入力自身の声を生のまま切り貼りして元曲を無理やり歌わせた」もの。
+ *
+ * 発音の明瞭さは入力素材依存：澄んだ（調波的な）声を入力にすると、選ばれる生スライスも
+ * 澄んだ音節になり発音がはっきりする。
  */
 export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
   const options: SpliceOptions = {
