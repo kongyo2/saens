@@ -19,39 +19,19 @@ export interface SpliceOptions {
   /** Pitch analysis bounds. */
   analyze: AnalyzeOptions;
   /**
-   * Octave-folded semitone tolerance used when *jumping* to a fresh source
-   * position. Grains outside this are only used when nothing closer carries the
-   * required phoneme.
+   * Octave-folded semitone tolerance for a slice's pitch vs the MIDI note.
+   * Slices outside this are only used when nothing closer carries the phoneme.
    */
   pitchTolerance: number;
   /**
-   * Hysteresis margin. Keep playing the current source run forward unless
-   * jumping elsewhere beats "continue" by more than this (phonetic-distance
-   * units). Larger → longer contiguous cut-and-paste chunks of the source's own
-   * words (the meme character); 0 → re-pick the best phoneme every frame.
-   */
-  continuityMargin: number;
-  /**
-   * How strongly a held run is pulled back toward the melody. A running chunk
-   * accrues this penalty per octave-folded semitone of pitch error, so it stays
-   * on the source's own words for a while but still breaks to chase the tune.
-   */
-  pitchDriftPenalty: number;
-  /**
-   * Consonant-joining strength (0..1). At reference frames where the spectrum
-   * changes sharply — consonant onsets / syllable attacks — continuity is
-   * suppressed by this much so a fresh matching consonant grain is stitched in,
-   * the way 人力 (hand-made) edits splice a crisp consonant onto a vowel. Steady
-   * vowels keep full continuity, so this sharpens articulation without flutter.
-   * Off by default: it fragments the raw slices that carry the meme character.
-   */
-  onsetSensitivity: number;
-  /**
-   * Minimum length (seconds) of a verbatim source slice before a cut is allowed.
-   * Long slices keep each piece recognisable as a raw chunk of the input (high
-   * "it's really them" character); the hand-made ideals sit around 0.15-0.25 s.
+   * Minimum slice length (seconds). A slice is matched to the reference across
+   * its whole length, so this trades pronunciation resolution (shorter → each
+   * slice hugs the words more tightly) against raw-chunk character (longer →
+   * more obviously the source itself). Cuts still land on MIDI note onsets.
    */
   minSliceSeconds: number;
+  /** Maximum slice length (seconds); long gaps between onsets are subdivided. */
+  maxSliceSeconds: number;
 }
 
 export const defaultSpliceOptions: SpliceOptions = {
@@ -59,10 +39,8 @@ export const defaultSpliceOptions: SpliceOptions = {
   tailSeconds: 0.25,
   analyze: defaultAnalyzeOptions,
   pitchTolerance: 2,
-  continuityMargin: 0.6,
-  pitchDriftPenalty: 0.05,
-  onsetSensitivity: 0,
-  minSliceSeconds: 0.15,
+  minSliceSeconds: 0.06,
+  maxSliceSeconds: 0.12,
 };
 
 // ---- lightweight FFT-autocorrelation pitch tracker (aligned to feature frames) ----
@@ -283,96 +261,77 @@ export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
     Math.floor(midiDuration / hopSeconds),
   );
 
-  // Onset strength per reference frame = how much its spectrum differs from the
-  // previous frame. Peaks mark consonant attacks / syllable starts, where we
-  // want to break continuity and stitch a fresh matching consonant grain.
-  const onsetStrength = new Float32Array(referenceFrameMax);
-  let onsetMean = 0;
-  for (let rf = 1; rf < referenceFrameMax; rf++) {
-    const flux = frameFeatureDistance(referenceIndex, rf, referenceIndex, rf - 1);
-    onsetStrength[rf] = flux;
-    onsetMean += flux;
-  }
-  onsetMean /= Math.max(1, referenceFrameMax - 1);
-  let onsetVariance = 0;
-  for (let rf = 1; rf < referenceFrameMax; rf++) {
-    const d = (onsetStrength[rf] ?? 0) - onsetMean;
-    onsetVariance += d * d;
-  }
-  const onsetScale = onsetMean + 1.5 * Math.sqrt(onsetVariance / Math.max(1, referenceFrameMax - 1));
-
   const frameCount = sourceIndex.frameCount;
-  // Source frame chosen for each output frame. `cursor` is the frame currently
-  // playing; it advances one frame at a time so the source's own words play
-  // through contiguously, jumping only when a fresh position matches markedly
-  // better. Actual audio is synthesised verbatim from these choices afterwards.
   const chosenFrames = new Int32Array(referenceFrameMax).fill(-1);
-  const minSliceFrames = Math.max(1, Math.round(options.minSliceSeconds / hopSeconds));
-  let cursor = -1;
-  let runLength = 0;
-  let contiguousFrames = 0;
+  const minUnit = Math.max(2, Math.round(options.minSliceSeconds / hopSeconds));
+  const maxUnit = Math.max(minUnit, Math.round(options.maxSliceSeconds / hopSeconds));
+
+  // Slice boundaries: cut on MIDI note onsets so each slice lands on the tune,
+  // but never shorter than minUnit (a slice must stay a recognisable raw chunk)
+  // and never longer than maxUnit.
+  const boundaries: number[] = [0];
+  const onsetFrames = [
+    ...new Set(notes.map((n) => Math.round(n.time / hopSeconds))),
+  ]
+    .filter((f) => f > 0 && f < referenceFrameMax)
+    .sort((a, b) => a - b);
+  for (const f of onsetFrames) {
+    const last = boundaries[boundaries.length - 1] ?? 0;
+    if (f - last >= minUnit) boundaries.push(f);
+  }
+  if ((boundaries[boundaries.length - 1] ?? 0) < referenceFrameMax) {
+    boundaries.push(referenceFrameMax);
+  }
+
+  // Whole-slice unit selection. For each slice, find the source position whose
+  // trajectory best matches the reference across the ENTIRE slice — not just its
+  // first frame. Matching the whole slice is what keeps the pronunciation while
+  // every slice is still copied verbatim (raw) from the input.
+  const sliceDistance = (sourceStart: number, refStart: number, len: number, ceiling: number): number => {
+    let d = 0;
+    for (let l = 0; l < len; l++) {
+      d += frameFeatureDistance(sourceIndex, sourceStart + l, referenceIndex, refStart + l);
+      if (d >= ceiling) return Infinity;
+    }
+    return d;
+  };
   let renderedFrames = 0;
-  for (let rf = 0; rf < referenceFrameMax; rf++) {
-    const targetPitch = pitchTargets[rf] ?? NaN;
-
-    // Best fresh position: closest phoneme among grains near the target pitch.
-    let bestJump = -1;
-    let bestJumpScore = Infinity;
-    if (!Number.isNaN(targetPitch)) {
-      for (let sf = 0; sf < frameCount; sf++) {
-        const sourceMidi = sourcePitch[sf] ?? NaN;
-        if (Number.isNaN(sourceMidi)) continue;
-        if (foldedDistance(sourceMidi, targetPitch) > options.pitchTolerance) continue;
-        const distance = frameFeatureDistance(sourceIndex, sf, referenceIndex, rf);
-        if (distance < bestJumpScore) {
-          bestJumpScore = distance;
-          bestJump = sf;
+  for (let bi = 0; bi < boundaries.length - 1; bi++) {
+    let uStart = boundaries[bi] ?? 0;
+    const uEnd = boundaries[bi + 1] ?? referenceFrameMax;
+    while (uStart < uEnd) {
+      const len = Math.min(maxUnit, uEnd - uStart);
+      const targetPitch = pitchTargets[uStart + (len >> 1)] ?? NaN;
+      const usePitch = !Number.isNaN(targetPitch);
+      let bestStart = -1;
+      let bestDist = Infinity;
+      for (let s = 0; s + len <= frameCount; s++) {
+        if (usePitch) {
+          const sm = sourcePitch[s] ?? NaN;
+          if (Number.isNaN(sm) || foldedDistance(sm, targetPitch) > options.pitchTolerance) continue;
+        }
+        const d = sliceDistance(s, uStart, len, bestDist);
+        if (d < bestDist) {
+          bestDist = d;
+          bestStart = s;
         }
       }
-    }
-    if (bestJump < 0) {
-      for (let sf = 0; sf < frameCount; sf++) {
-        const distance = frameFeatureDistance(sourceIndex, sf, referenceIndex, rf);
-        if (distance < bestJumpScore) {
-          bestJumpScore = distance;
-          bestJump = sf;
+      if (bestStart < 0) {
+        // Nothing at the required pitch: match on phonetics alone.
+        for (let s = 0; s + len <= frameCount; s++) {
+          const d = sliceDistance(s, uStart, len, bestDist);
+          if (d < bestDist) {
+            bestDist = d;
+            bestStart = s;
+          }
         }
       }
-    }
-
-    // Continuity is relaxed at consonant onsets so a fresh consonant grain is
-    // stitched in (the 人力 consonant-join), and full through steady vowels.
-    const onsetNorm = onsetScale > 0 ? Math.min(1, (onsetStrength[rf] ?? 0) / onsetScale) : 0;
-    const effectiveMargin =
-      options.continuityMargin * Math.max(0, 1 - options.onsetSensitivity * onsetNorm);
-
-    // Continue the current raw slice forward, cutting to a fresh position only
-    // when the slice has reached its minimum length AND jumping matches clearly
-    // better. A gentle pitch-drift pull keeps a held slice near the tune.
-    const prevCursor = cursor;
-    let chosen = bestJump;
-    if (prevCursor >= 0 && prevCursor + 1 < frameCount) {
-      const contFrame = prevCursor + 1;
-      let contScore = frameFeatureDistance(sourceIndex, contFrame, referenceIndex, rf);
-      const contMidi = sourcePitch[contFrame] ?? NaN;
-      if (!Number.isNaN(targetPitch) && !Number.isNaN(contMidi)) {
-        contScore += foldedDistance(contMidi, targetPitch) * options.pitchDriftPenalty;
+      if (bestStart >= 0) {
+        for (let l = 0; l < len; l++) chosenFrames[uStart + l] = bestStart + l;
+        renderedFrames += len;
       }
-      const tooShortToCut = runLength < minSliceFrames;
-      if (tooShortToCut || contScore <= bestJumpScore + effectiveMargin) {
-        chosen = contFrame;
-      }
+      uStart += len;
     }
-    if (chosen < 0) continue;
-    if (prevCursor >= 0 && chosen === prevCursor + 1) {
-      runLength++;
-      contiguousFrames++;
-    } else {
-      runLength = 0;
-    }
-    cursor = chosen;
-    renderedFrames++;
-    chosenFrames[rf] = chosen;
   }
 
   // Synthesise VERBATIM: group the choices into contiguous runs and copy raw
@@ -423,7 +382,6 @@ export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
   }
 
   if (process.env.SPLICE_DEBUG === "1") {
-    const contiguity = renderedFrames > 0 ? contiguousFrames / renderedFrames : 0;
     let slices = 0, backJumps = 0, jumpMag = 0, prevStart = -1;
     for (let i = 0; i < referenceFrameMax; ) {
       if ((chosenFrames[i] ?? -1) < 0) { i++; continue; }
@@ -435,7 +393,7 @@ export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
       i++;
     }
     process.stderr.write(
-      `[splice] contiguity=${contiguity.toFixed(3)} frames=${renderedFrames} slices=${slices} avgSlice=${(renderedFrames / Math.max(1, slices) * hopSeconds * 1000).toFixed(0)}ms backJumpFrac=${(backJumps / Math.max(1, slices)).toFixed(2)} avgJump=${(jumpMag / Math.max(1, slices) * hopSeconds).toFixed(2)}s\n`,
+      `[splice] frames=${renderedFrames} slices=${slices} avgSlice=${(renderedFrames / Math.max(1, slices) * hopSeconds * 1000).toFixed(0)}ms backJumpFrac=${(backJumps / Math.max(1, slices)).toFixed(2)} avgJump=${(jumpMag / Math.max(1, slices) * hopSeconds).toFixed(2)}s\n`,
     );
   }
 
