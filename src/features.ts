@@ -18,6 +18,32 @@ const zeroCrossingFeature = flatnessFeature + 1;
 
 const featureWeights = createFeatureWeights();
 
+export const audioFeatureCount = featureCount;
+
+/**
+ * Weighted phonetic distance between one frame of two feature indexes. Emphasises
+ * the MFCC/mel dimensions that carry vowel/consonant identity, so a small value
+ * means the two frames "sound like" the same phoneme.
+ */
+export function frameFeatureDistance(
+  a: AudioFeatureIndex,
+  frameA: number,
+  b: AudioFeatureIndex,
+  frameB: number,
+): number {
+  const offA = frameA * featureCount;
+  const offB = frameB * featureCount;
+  let total = 0;
+  let weightTotal = 0;
+  for (let dim = 0; dim < featureCount; dim++) {
+    const weight = featureWeights[dim] ?? 1;
+    const diff = (a.features[offA + dim] ?? 0) - (b.features[offB + dim] ?? 0);
+    total += diff * diff * weight;
+    weightTotal += weight;
+  }
+  return weightTotal > 0 ? Math.sqrt(total / weightTotal) : 0;
+}
+
 export interface AudioFeatureIndex {
   sampleRate: number;
   frameSize: number;
