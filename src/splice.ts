@@ -50,7 +50,9 @@ export const defaultSpliceOptions: SpliceOptions = {
   pitchTolerance: 2,
   continuityMargin: 0.6,
   pitchDriftPenalty: 0.05,
-  onsetSensitivity: 0.85,
+  // Kept low on purpose: the charm is the source's own words jammed in verbatim,
+  // not clean re-articulated consonants. Only a light onset nudge.
+  onsetSensitivity: 0.3,
 };
 
 // ---- lightweight FFT-autocorrelation pitch tracker (aligned to feature frames) ----
