@@ -8,8 +8,12 @@ import type { MidiNote } from "./midi.js";
 import { defaultAnalyzeOptions, type AnalyzeOptions } from "./pitch.js";
 
 export interface SpliceOptions {
-  /** Hann grain length (seconds) overlap-added at each analysis frame. */
-  grainSeconds: number;
+  /**
+   * Equal-power crossfade (seconds) applied only at cut points between two
+   * source slices. Kept short so each slice is heard as a raw, verbatim piece
+   * of the input — the hand-cut character — rather than a resynthesis.
+   */
+  crossfadeSeconds: number;
   /** Silence appended after the reference/MIDI content, in seconds. */
   tailSeconds: number;
   /** Pitch analysis bounds. */
@@ -39,20 +43,26 @@ export interface SpliceOptions {
    * suppressed by this much so a fresh matching consonant grain is stitched in,
    * the way 人力 (hand-made) edits splice a crisp consonant onto a vowel. Steady
    * vowels keep full continuity, so this sharpens articulation without flutter.
+   * Off by default: it fragments the raw slices that carry the meme character.
    */
   onsetSensitivity: number;
+  /**
+   * Minimum length (seconds) of a verbatim source slice before a cut is allowed.
+   * Long slices keep each piece recognisable as a raw chunk of the input (high
+   * "it's really them" character); the hand-made ideals sit around 0.15-0.25 s.
+   */
+  minSliceSeconds: number;
 }
 
 export const defaultSpliceOptions: SpliceOptions = {
-  grainSeconds: 0.03,
+  crossfadeSeconds: 0.006,
   tailSeconds: 0.25,
   analyze: defaultAnalyzeOptions,
   pitchTolerance: 2,
   continuityMargin: 0.6,
   pitchDriftPenalty: 0.05,
-  // Kept low on purpose: the charm is the source's own words jammed in verbatim,
-  // not clean re-articulated consonants. Only a light onset nudge.
-  onsetSensitivity: 0.3,
+  onsetSensitivity: 0,
+  minSliceSeconds: 0.15,
 };
 
 // ---- lightweight FFT-autocorrelation pitch tracker (aligned to feature frames) ----
@@ -266,13 +276,6 @@ export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
 
   const outputLength = Math.ceil((midiDuration + options.tailSeconds) * sampleRate);
   const output = new Float32Array(outputLength);
-  const weight = new Float32Array(outputLength);
-
-  const grainSamples = Math.max(2, Math.floor(options.grainSeconds * sampleRate));
-  const grainWindow = new Float64Array(grainSamples);
-  for (let i = 0; i < grainSamples; i++) {
-    grainWindow[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (grainSamples - 1));
-  }
   const sourceHopSamples = sourceIndex.hopSize;
 
   const referenceFrameMax = Math.min(
@@ -299,10 +302,14 @@ export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
   const onsetScale = onsetMean + 1.5 * Math.sqrt(onsetVariance / Math.max(1, referenceFrameMax - 1));
 
   const frameCount = sourceIndex.frameCount;
-  // `cursor` is the source frame currently playing; it advances one frame at a
-  // time so the source's own words play through contiguously, and only jumps
-  // when a fresh position matches the target phoneme markedly better.
+  // Source frame chosen for each output frame. `cursor` is the frame currently
+  // playing; it advances one frame at a time so the source's own words play
+  // through contiguously, jumping only when a fresh position matches markedly
+  // better. Actual audio is synthesised verbatim from these choices afterwards.
+  const chosenFrames = new Int32Array(referenceFrameMax).fill(-1);
+  const minSliceFrames = Math.max(1, Math.round(options.minSliceSeconds / hopSeconds));
   let cursor = -1;
+  let runLength = 0;
   let contiguousFrames = 0;
   let renderedFrames = 0;
   for (let rf = 0; rf < referenceFrameMax; rf++) {
@@ -339,40 +346,70 @@ export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
     const effectiveMargin =
       options.continuityMargin * Math.max(0, 1 - options.onsetSensitivity * onsetNorm);
 
-    // Cost of simply continuing the current run one frame forward, with a gentle
-    // pull back toward the melody so a run doesn't hold a wrong pitch forever.
+    // Continue the current raw slice forward, cutting to a fresh position only
+    // when the slice has reached its minimum length AND jumping matches clearly
+    // better. A gentle pitch-drift pull keeps a held slice near the tune.
+    const prevCursor = cursor;
     let chosen = bestJump;
-    if (cursor >= 0 && cursor + 1 < frameCount) {
-      const contFrame = cursor + 1;
+    if (prevCursor >= 0 && prevCursor + 1 < frameCount) {
+      const contFrame = prevCursor + 1;
       let contScore = frameFeatureDistance(sourceIndex, contFrame, referenceIndex, rf);
       const contMidi = sourcePitch[contFrame] ?? NaN;
       if (!Number.isNaN(targetPitch) && !Number.isNaN(contMidi)) {
         contScore += foldedDistance(contMidi, targetPitch) * options.pitchDriftPenalty;
       }
-      if (contScore <= bestJumpScore + effectiveMargin) {
+      const tooShortToCut = runLength < minSliceFrames;
+      if (tooShortToCut || contScore <= bestJumpScore + effectiveMargin) {
         chosen = contFrame;
-        contiguousFrames++;
       }
     }
     if (chosen < 0) continue;
+    if (prevCursor >= 0 && chosen === prevCursor + 1) {
+      runLength++;
+      contiguousFrames++;
+    } else {
+      runLength = 0;
+    }
     cursor = chosen;
     renderedFrames++;
-
-    const sourceStart = chosen * sourceHopSamples;
-    const destStart = Math.floor(rf * hopSeconds * sampleRate);
-    for (let i = 0; i < grainSamples; i++) {
-      const dst = destStart + i;
-      if (dst >= output.length) break;
-      const value = source.samples[sourceStart + i] ?? 0;
-      const w = grainWindow[i] ?? 0;
-      output[dst] = (output[dst] ?? 0) + value * w;
-      weight[dst] = (weight[dst] ?? 0) + w;
-    }
+    chosenFrames[rf] = chosen;
   }
 
-  for (let i = 0; i < output.length; i++) {
-    const w = weight[i] ?? 0;
-    if (w > 1e-6) output[i] = (output[i] ?? 0) / w;
+  // Synthesise VERBATIM: group the choices into contiguous runs and copy raw
+  // source samples for each run, so the output is literally hand-cut slices of
+  // the input. Only the cut points are crossfaded (equal power), so the middle
+  // of every slice is bit-identical to the source — this is what makes it read
+  // as "the source itself, forced" rather than a resynthesis.
+  const framesPerHop = hopSeconds * sampleRate;
+  const xfade = Math.max(1, Math.floor(options.crossfadeSeconds * sampleRate));
+  let rf = 0;
+  while (rf < referenceFrameMax) {
+    if ((chosenFrames[rf] ?? -1) < 0) {
+      rf++;
+      continue;
+    }
+    const runStart = rf;
+    while (
+      rf + 1 < referenceFrameMax &&
+      (chosenFrames[rf + 1] ?? -1) === (chosenFrames[rf] ?? -1) + 1
+    ) {
+      rf++;
+    }
+    const runEnd = rf; // inclusive
+    const sourceStart = (chosenFrames[runStart] ?? 0) * sourceHopSamples;
+    const destStart = Math.floor(runStart * framesPerHop);
+    const runSamples = Math.max(1, Math.round((runEnd - runStart + 1) * framesPerHop));
+    // Copy verbatim; fade in over the first xfade (crossfading the previous
+    // run's tail) and fade out over an extra xfade past the end.
+    for (let i = 0; i < runSamples + xfade; i++) {
+      const dst = destStart + i;
+      if (dst < 0 || dst >= output.length) break;
+      let gain = 1;
+      if (i < xfade) gain = Math.sin((Math.PI / 2) * (i / xfade));
+      if (i >= runSamples) gain = Math.sin((Math.PI / 2) * ((runSamples + xfade - i) / xfade));
+      output[dst] = (output[dst] ?? 0) + (source.samples[sourceStart + i] ?? 0) * gain;
+    }
+    rf++;
   }
 
   let peak = 0;
@@ -387,8 +424,18 @@ export function spliceAudioFromMidi(input: SpliceInput): AudioBuffer {
 
   if (process.env.SPLICE_DEBUG === "1") {
     const contiguity = renderedFrames > 0 ? contiguousFrames / renderedFrames : 0;
+    let slices = 0, backJumps = 0, jumpMag = 0, prevStart = -1;
+    for (let i = 0; i < referenceFrameMax; ) {
+      if ((chosenFrames[i] ?? -1) < 0) { i++; continue; }
+      const start = chosenFrames[i] ?? 0;
+      slices++;
+      if (prevStart >= 0) { const d = start - prevStart; if (d < 0) backJumps++; jumpMag += Math.abs(d); }
+      prevStart = start;
+      while (i + 1 < referenceFrameMax && (chosenFrames[i + 1] ?? -1) === (chosenFrames[i] ?? -1) + 1) i++;
+      i++;
+    }
     process.stderr.write(
-      `[splice] contiguity=${contiguity.toFixed(3)} frames=${renderedFrames}\n`,
+      `[splice] contiguity=${contiguity.toFixed(3)} frames=${renderedFrames} slices=${slices} avgSlice=${(renderedFrames / Math.max(1, slices) * hopSeconds * 1000).toFixed(0)}ms backJumpFrac=${(backJumps / Math.max(1, slices)).toFixed(2)} avgJump=${(jumpMag / Math.max(1, slices) * hopSeconds).toFixed(2)}s\n`,
     );
   }
 
